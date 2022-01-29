@@ -3,21 +3,16 @@
 name: Release
 
 on:
-
-  # 在 Release Issue 评论特定内容后执行
-  issue_comment:
-    events: [created]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version you want to release, eg: 1.0.0"
+        required: true
 
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    if: |
-      (github.event.issue.author_association == 'OWNER') &&
-      ((contains(github.event.issue.body, 'Release Summary') &&
-        contains(github.event.issue.title,'OpenSumi Release')) &&
-        startsWith(github.event.comment.body, '/release')) &&
-      contains(github.event.issue.labels.*.name, 'release')
 
     strategy:
       matrix:
@@ -31,26 +26,16 @@ jobs:
         uses: actions/setup-node@v1
         with:
           node-version: ${{ matrix.node-version }}
-          registry-url: 'https://registry.npmjs.org'
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Set Current Version
-        run: |
-          CURRENT_VERSION=$(node -p 'require("./lerna.json").version')
-          echo "CURRENT_VERSION=${CURRENT_VERSION}" >> $GITHUB_ENV
-
-      - name: Tag Check
-        id: tag_check
-        run: |
-          GET_API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/v${CURRENT_VERSION}"
-          http_status_code=$(curl -LI $GET_API_URL -o /dev/null -w '%{http_code}\n' -s \
-            -H "Authorization: token ${GITHUB_TOKEN}")
-          if [ "$http_status_code" -ne "404" ] ; then
-            echo "::set-output name=exists_tag::true"
-          else
-            echo "::set-output name=exists_tag::false"
-          fi
+      - uses: mukunku/tag-exists-action@v1.0.0
+        id: checkTag
+        env:
+          TAG: v${{github.event.inputs.version}}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Git Identity
+        if: steps.checkTag.outputs.exists == 'false'
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
@@ -60,42 +45,34 @@ jobs:
 
       # 安装依赖并构建
       - name: Install dependencies & Build
+        if: steps.checkTag.outputs.exists == 'false'
         run: |
           npm i
           npm run init
 
       # 生成 Changelog, 会将内容写入到 ./releaselog.md 中
       - name: Create release log
+        if: steps.checkTag.outputs.exists == 'false'
         id: release-log
         run: |
           npm run changelog -- --remote
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 更新 Changelog 到 release issue 正文
-      - name: Update prerelease changelog for current issue
-        uses: actions/github-script@v4
-        id: changelog
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          # JavaScript
-          script: |
-            const fs = require('fs');
-            const releasemd = fs.readFileSync('./releaselog.md', 'utf8').toString();
-            github.issues.update({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `🤖 OpenSumi Release v${process.env.CURRENT_VERSION} - ${new Date().toDateString()}`,
-              body: `## v${process.env.CURRENT_VERSION} Release Summary \r\n ${releasemd}`
-            });
-            return releasemd;
+      # 发布正式版本
+      - name: Publish prod version
+        if: steps.checkTag.outputs.exists == 'false'
+        run: |
+          lerna publish --exact ${{github.event.inputs.version}} --dist-tag latest --force-publish='*' --ignore-prepublish --ignore-scripts --no-private -y
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create Git Tag
-        if: steps.tag_check.outputs.exists_tag == 'false'
+        if: steps.checkTag.outputs.exists == 'false'
         uses: pkgdeps/git-tag-action@v2
         with:
-          version: ${{ env.CURRENT_VERSION }}
+          version: v${{ github.event.inputs.version }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_repo: ${{ github.repository }}
           git_commit_sha: ${{ github.sha }}
@@ -103,57 +80,32 @@ jobs:
 
       - name: Create Release
         id: create_release
-        if: steps.tag_check.outputs.exists_tag == 'false'
+        if: steps.checkTag.outputs.exists == 'false'
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v${{ env.CURRENT_VERSION }}
-          release_name: OpenSumi Release v${{ env.CURRENT_VERSION }}
-          body: |
-            ${{steps.changelog.outputs.result}}
+          tag_name: v${{ github.event.inputs.version }}
+          release_name: OpenSumi Release v${{ github.event.inputs.version }}
+          body_path: ./releaselog.md
           draft: false
           prerelease: false
 
-      # 发布正式版本，并在 issue 中回复
-      - name: Publish prod version
-        if: steps.tag_check.outputs.exists_tag == 'false'
+      - name: Create and push release branch
+        if: github.event.ref == 'refs/heads/main'
         run: |
-          lerna publish --exact from-package --dist-tag latest --force-publish='*' --ignore-prepublish --ignore-scripts --no-private -y
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          git checkout -b v${{ github.event.inputs.version }}
+          git push origin v${{ github.event.inputs.version }}
 
-      - uses: actions/github-script@v4
+      - name: Create pull request
+        if: github.event.ref == 'refs/heads/main'
+        uses: peter-evans/create-pull-request@v3
         with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const issueBody =
-              '🎉 New release version ' +
-              process.env.CURRENT_VERSION +
-              ' publish successful! You can install release version via `npm install package@' +
-              process.env.CURRENT_VERSION;
-
-            // 在 issue 中通知版本已发布完，并附带版本号
-            github.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: issueBody,
-            });
-
-            // 关闭 issue
-            github.issues.update({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'closed'
-            });
-
-            // 锁定 issue
-            github.issues.lock({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              lock_reason: 'resolved',
-            });
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Update v${{ github.event.inputs.version }}"
+          committer: GitHub <noreply@github.com>
+          author: "${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>"
+          title: 'chore: v${{ github.event.inputs.version }}'
+          labels: "release"
+          branch: v${{ github.event.inputs.version }}
+          base: "main"
